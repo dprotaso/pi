@@ -167,14 +167,20 @@ export class AgentSessionRuntime {
 	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
 		// Settle any active response first so the aborted turn (including tool
 		// results) is persisted to the outgoing session before it is replaced.
-		await this.session.abort();
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
-			reason,
-			targetSessionFile,
-		});
-		this.beforeSessionInvalidate?.();
-		this.session.dispose();
+		const session = this.session;
+		const resume = session.suspendExecutionDirectories();
+		try {
+			await session.abort();
+			await emitSessionShutdownEvent(session.extensionRunner, {
+				type: "session_shutdown",
+				reason,
+				targetSessionFile,
+			});
+			this.beforeSessionInvalidate?.();
+			session.dispose();
+		} finally {
+			resume();
+		}
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {

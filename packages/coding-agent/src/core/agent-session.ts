@@ -78,6 +78,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
+import { ExecutionDirectory } from "./execution-directory.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -146,7 +147,7 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
-import { createAllToolDefinitions } from "./tools/index.ts";
+import { allToolNames, createToolDefinition } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
@@ -438,6 +439,8 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private readonly _executionDirectory: ExecutionDirectory;
+	private _runExecutionDirectory: string | undefined;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	/**
@@ -491,6 +494,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._executionDirectory = new ExecutionDirectory(config.cwd, () => this._updateExecutionDirectoryStatus());
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
 		if (this._cacheWarmer) {
@@ -524,6 +528,43 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
+	}
+
+	get executionDirectory(): string {
+		return this._executionDirectory.cwd;
+	}
+
+	get activeExecutionDirectories(): readonly string[] {
+		return this._executionDirectory.activeDirectories;
+	}
+
+	withExecutionDirectory<T>(directory: string, callback: () => Promise<T>): Promise<T> {
+		return this._executionDirectory.run(directory, callback);
+	}
+
+	suspendExecutionDirectories(): () => void {
+		return this._executionDirectory.suspend();
+	}
+
+	private _updateExecutionDirectoryStatus(): void {
+		const directories = this.activeExecutionDirectories;
+		this._extensionUIContext?.setStatus?.(
+			"pi:execution-directory",
+			directories.length > 0
+				? `exec: ${directories.map((directory) => JSON.stringify(directory)).join(" | ")}`
+				: undefined,
+		);
+	}
+
+	private _assertRunExecutionDirectory(): void {
+		this._executionDirectory.assertActive();
+		if (
+			this.isStreaming &&
+			this._executionDirectory.isScoped &&
+			this.executionDirectory !== this._runExecutionDirectory
+		) {
+			throw new Error("Cannot queue input from a different execution directory into the active run");
+		}
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -1077,7 +1118,7 @@ export class AgentSession {
 	}
 
 	private async _emitAgentSettled(): Promise<void> {
-		this._cacheWarmer?.onAgentSettled();
+		this._executionDirectory.outsideScope(() => this._cacheWarmer?.onAgentSettled());
 		this._isAgentRunActive = false;
 		this._isEmittingAgentSettled = true;
 		try {
@@ -1105,6 +1146,10 @@ export class AgentSession {
 		// An abort requested while the run was starting, e.g. during before_agent_start, stops it
 		// here. agent_start is awaited before the first request.
 		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
+		if (event.type === "message_start" && event.message.role === "toolResult") {
+			const cwd = this.executionDirectory;
+			if (cwd !== this._cwd) event.message.executionCwd = cwd;
+		}
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
@@ -1395,6 +1440,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._executionDirectory.dispose();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1472,7 +1518,10 @@ export class AgentSession {
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
-		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
+		return buildSystemPrompt({
+			...(this._runSystemPromptOptions ?? this._baseSystemPromptOptions),
+			...(this._executionDirectory.isScoped ? { cwd: this.executionDirectory } : {}),
+		});
 	}
 
 	/** Current retry attempt (0 if not retrying) */
@@ -1835,6 +1884,7 @@ export class AgentSession {
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		this._runExecutionDirectory = this.executionDirectory;
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
 		let messages: AgentMessage[];
@@ -1896,7 +1946,10 @@ export class AgentSession {
 		}
 
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
+		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, {
+			...this._baseSystemPromptOptions,
+			...(this._executionDirectory.isScoped ? { cwd: this.executionDirectory } : {}),
+		});
 		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 		// which updates the live loadout instead. An explicit edit wins; otherwise the live
 		// loadout is authoritative, so a setActiveTools() call is not undone here.
@@ -2056,7 +2109,11 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this._assertRunExecutionDirectory();
 		if (this._isEmittingAgentSettled) {
+			if (this._executionDirectory.isScoped) {
+				throw new Error("Cannot defer scoped input from agent_settled; submit it after settlement");
+			}
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
 		}
@@ -2100,6 +2157,7 @@ export class AgentSession {
 		}
 
 		// If streaming, queue via steer() or followUp() based on option
+		this._assertRunExecutionDirectory();
 		if (this.isStreaming) {
 			if (!options?.streamingBehavior) {
 				throw new Error(
@@ -2135,6 +2193,8 @@ export class AgentSession {
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
 
+		this._assertRunExecutionDirectory();
+		if (this.isStreaming) throw new Error("Agent started processing during prompt preparation; retry the prompt");
 		await this._startRun({ messageType: "user", prompt: expandedText, images: currentImages }, () =>
 			preflightResult?.("started"),
 		);
@@ -2206,6 +2266,7 @@ export class AgentSession {
 		behavior: "steer" | "followUp",
 		source: InputSource,
 	): Promise<QueuedInputDisposition> {
+		this._assertRunExecutionDirectory();
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
 		}
@@ -2266,6 +2327,8 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		this._assertRunExecutionDirectory();
+		this._assertScopedQueueHasRun();
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -2283,6 +2346,8 @@ export class AgentSession {
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+		this._assertRunExecutionDirectory();
+		this._assertScopedQueueHasRun();
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -2290,6 +2355,12 @@ export class AgentSession {
 			content.push(...images);
 		}
 		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+	}
+
+	private _assertScopedQueueHasRun(): void {
+		if (this._executionDirectory.isScoped && !this.isStreaming) {
+			throw new Error("Cannot queue scoped input without an active run; start a prompt inside the scope instead");
+		}
 	}
 
 	/**
@@ -2324,6 +2395,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		this._assertRunExecutionDirectory();
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -2334,6 +2406,9 @@ export class AgentSession {
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
+			if (this._executionDirectory.isScoped) {
+				throw new Error("Cannot defer scoped input to nextTurn; start a prompt inside the scope instead");
+			}
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
 			if (options?.deliverAs === "followUp") {
@@ -2343,6 +2418,9 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			if (this._isEmittingAgentSettled) {
+				if (this._executionDirectory.isScoped) {
+					throw new Error("Cannot defer scoped input from agent_settled; submit it after settlement");
+				}
 				this._deferredSettledActions.push(async () => await this.sendCustomMessage(message, options));
 				return;
 			}
@@ -3365,6 +3443,7 @@ export class AgentSession {
 
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
 		runner.setUIContext(this._extensionUIContext, this._extensionMode);
+		this._updateExecutionDirectoryStatus();
 		runner.bindCommandContext(this._extensionCommandContextActions);
 
 		this._extensionErrorUnsubscriber?.();
@@ -3416,22 +3495,24 @@ export class AgentSession {
 		runner.bindCore(
 			{
 				sendMessage: (message, options) => {
-					this.sendCustomMessage(message, options).catch((err) => {
+					const pending = this.sendCustomMessage(message, options).catch((err) => {
 						runner.emitError({
 							extensionPath: "<runtime>",
 							event: "send_message",
 							error: err instanceof Error ? err.message : String(err),
 						});
 					});
+					this._executionDirectory.track(pending);
 				},
 				sendUserMessage: (content, options) => {
-					this.sendUserMessage(content, options).catch((err) => {
+					const pending = this.sendUserMessage(content, options).catch((err) => {
 						runner.emitError({
 							extensionPath: "<runtime>",
 							event: "send_user_message",
 							error: err instanceof Error ? err.message : String(err),
 						});
 					});
+					this._executionDirectory.track(pending);
 				},
 				appendEntry: (customType, data) => {
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
@@ -3493,7 +3574,10 @@ export class AgentSession {
 					})();
 				},
 				getSystemPrompt: () => this.systemPrompt,
-				getSystemPromptOptions: () => this._baseSystemPromptOptions,
+				getSystemPromptOptions: () =>
+					this._executionDirectory.isScoped
+						? { ...this._baseSystemPromptOptions, cwd: this.executionDirectory }
+						: this._baseSystemPromptOptions,
 				executeTool: (callerId, name, args, options) => this._executeNestedToolCall(callerId, name, args, options),
 				getCallableTools: () => this._getCallableTools(),
 			},
@@ -3648,10 +3732,26 @@ export class AgentSession {
 						createToolDefinitionFromAgentTool(tool),
 					]),
 				)
-			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages },
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
-				});
+			: Object.fromEntries(
+					[...allToolNames].map((name) => {
+						const toolOptions = {
+							read: { autoResizeImages },
+							bash: { commandPrefix: shellCommandPrefix, shellPath },
+						};
+						const definition = createToolDefinition(name, this._cwd, toolOptions);
+						return [
+							name,
+							{
+								...definition,
+								execute: (...args: Parameters<typeof definition.execute>) => {
+									const cwd = this.executionDirectory;
+									const tool = cwd === this._cwd ? definition : createToolDefinition(name, cwd, toolOptions);
+									return tool.execute(...args);
+								},
+							},
+						];
+					}),
+				);
 
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
@@ -3670,6 +3770,7 @@ export class AgentSession {
 			this._cwd,
 			this.sessionManager,
 			new ModelRegistry(this._modelRuntime),
+			this._executionDirectory,
 		);
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
@@ -3688,6 +3789,15 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		const resume = this.suspendExecutionDirectories();
+		try {
+			await this._reload(options);
+		} finally {
+			resume();
+		}
+	}
+
+	private async _reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -3884,7 +3994,7 @@ export class AgentSession {
 		try {
 			const result = await executeBashWithOperations(
 				resolvedCommand,
-				this.sessionManager.getCwd(),
+				this.executionDirectory,
 				options?.operations ?? createLocalBashOperations({ shellPath }),
 				{
 					onChunk: (delta) => {

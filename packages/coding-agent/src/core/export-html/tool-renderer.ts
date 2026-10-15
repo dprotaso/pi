@@ -16,7 +16,7 @@ export interface ToolHtmlRendererDeps {
 	getToolRenderers: (name: string) => ToolRenderers | undefined;
 	/** Theme for styling */
 	theme: Theme;
-	/** Working directory for render context */
+	/** Session working directory, used when a result has no executionCwd metadata. */
 	cwd: string;
 	/** Terminal width for rendering (default: 100) */
 	width?: number;
@@ -24,7 +24,7 @@ export interface ToolHtmlRendererDeps {
 
 export interface ToolHtmlRenderer {
 	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
-	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
+	renderCall(toolCallId: string, toolName: string, args: unknown, executionCwd?: string): string | undefined;
 	/** Render a tool result to collapsed/expanded HTML. Returns undefined if tool has no custom renderer. */
 	renderResult(
 		toolCallId: string,
@@ -32,6 +32,7 @@ export interface ToolHtmlRenderer {
 		result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
 		details: unknown,
 		isError: boolean,
+		executionCwd?: string,
 	): { collapsed?: string; expanded?: string } | undefined;
 }
 
@@ -78,6 +79,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 		expanded: boolean,
 		isPartial: boolean,
 		isError: boolean,
+		executionCwd?: string,
 	): ToolRenderContext => {
 		return {
 			args: renderedArgs.get(toolCallId),
@@ -85,7 +87,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 			invalidate: () => {},
 			lastComponent,
 			state: getState(toolCallId),
-			cwd,
+			cwd: executionCwd ?? cwd,
 			executionStarted: true,
 			argsComplete: true,
 			isPartial,
@@ -98,7 +100,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 	};
 
 	return {
-		renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined {
+		renderCall(toolCallId: string, toolName: string, args: unknown, executionCwd?: string): string | undefined {
 			try {
 				renderedArgs.set(toolCallId, args);
 				const toolDef = getToolRenderers(toolName);
@@ -109,7 +111,14 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 				const component = toolDef.renderCall(
 					args,
 					theme,
-					createRenderContext(toolCallId, renderedCallComponents.get(toolCallId), false, true, false),
+					createRenderContext(
+						toolCallId,
+						renderedCallComponents.get(toolCallId),
+						false,
+						true,
+						false,
+						executionCwd,
+					),
 				);
 				renderedCallComponents.set(toolCallId, component);
 				const lines = component.render(width);
@@ -126,6 +135,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 			result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
 			details: unknown,
 			isError: boolean,
+			executionCwd?: string,
 		): { collapsed?: string; expanded?: string } | undefined {
 			try {
 				const toolDef = getToolRenderers(toolName);
@@ -146,7 +156,14 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 					agentToolResult,
 					{ expanded: false, isPartial: false },
 					theme,
-					createRenderContext(toolCallId, renderedResultComponents.get(toolCallId), false, false, isError),
+					createRenderContext(
+						toolCallId,
+						renderedResultComponents.get(toolCallId),
+						false,
+						false,
+						isError,
+						executionCwd,
+					),
 				);
 				renderedResultComponents.set(toolCallId, collapsedComponent);
 				const collapsed = ansiLinesToHtml(trimRenderedResultLines(collapsedComponent.render(width)));
@@ -156,7 +173,14 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 					agentToolResult,
 					{ expanded: true, isPartial: false },
 					theme,
-					createRenderContext(toolCallId, renderedResultComponents.get(toolCallId), true, false, isError),
+					createRenderContext(
+						toolCallId,
+						renderedResultComponents.get(toolCallId),
+						true,
+						false,
+						isError,
+						executionCwd,
+					),
 				);
 				renderedResultComponents.set(toolCallId, expandedComponent);
 				const expanded = ansiLinesToHtml(trimRenderedResultLines(expandedComponent.render(width)));

@@ -78,6 +78,7 @@ import {
 import { formatCacheWarmingStatus, formatCacheWarmingUsage } from "../../core/cache-warmer.ts";
 import { findExtensionStackMatches, recordCrash, takeUnnotifiedCrash } from "../../core/crash-log.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "../../core/defaults.ts";
+import { ExecutionDirectoryBusyError } from "../../core/execution-directory.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -612,6 +613,7 @@ export class InteractiveMode {
 		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.clearStatusIndicator();
 			this.resetExtensionUI();
 		});
 		this.runtimeHost.setRebindSession(async () => {
@@ -1979,7 +1981,6 @@ export class InteractiveMode {
 			commandContextActions: {
 				waitForIdle: () => this.session.waitForIdle(),
 				newSession: async (options) => {
-					this.clearStatusIndicator();
 					try {
 						return await this.runtimeHost.newSession(options);
 					} catch (error: unknown) {
@@ -2115,9 +2116,12 @@ export class InteractiveMode {
 		this.updateTerminalTitle();
 	}
 
-	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
+	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<{ cancelled: true }> {
 		const message = error instanceof Error ? error.message : String(error);
 		this.showError(`${prefix}: ${message}`);
+		if (error instanceof ExecutionDirectoryBusyError) {
+			return { cancelled: true };
+		}
 		const extensionHint = this.getCrashExtensionHint(error);
 		if (extensionHint) {
 			this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", extensionHint), this.outputPad, 0));
@@ -2243,11 +2247,15 @@ export class InteractiveMode {
 		if (shortcuts.size === 0) return;
 
 		// Create a context for shortcut handlers
+		const mode = this;
 		const createContext = (): ExtensionContext => ({
 			ui: this.createExtensionUIContext(),
 			mode: "tui",
 			hasUI: true,
-			cwd: this.sessionManager.getCwd(),
+			get cwd() {
+				return mode.session.executionDirectory;
+			},
+			withExecutionDirectory: (directory, callback) => this.session.withExecutionDirectory(directory, callback),
 			sessionManager: this.sessionManager,
 			modelRegistry: extensionRunner.getModelRegistry(),
 			model: this.session.model,
@@ -3540,7 +3548,7 @@ export class InteractiveMode {
 									},
 									this.getRegisteredToolDefinition(content.name),
 									this.ui,
-									this.sessionManager.getCwd(),
+									this.session.executionDirectory,
 								);
 								component.setExpanded(this.toolOutputExpanded);
 								this.chatContainer.addChild(component);
@@ -3619,7 +3627,7 @@ export class InteractiveMode {
 						},
 						this.getRegisteredToolDefinition(event.toolName),
 						this.ui,
-						this.sessionManager.getCwd(),
+						this.session.executionDirectory,
 					);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);
@@ -4006,6 +4014,13 @@ export class InteractiveMode {
 	): void {
 		this.pendingTools.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
+		// Calls render before their results, so recover their execution directories up front.
+		const executionDirectories = new Map<string, string>();
+		for (const item of items) {
+			if ("role" in item && item.role === "toolResult" && item.executionCwd !== undefined) {
+				executionDirectories.set(item.toolCallId, item.executionCwd);
+			}
+		}
 		// Cache misses are not persisted, unlike successful cache-warming usage.
 		// Re-derive them and inject them after the assistant messages that paid for them.
 		const cacheMisses = this.settingsManager.getShowCacheMissNotices()
@@ -4049,7 +4064,7 @@ export class InteractiveMode {
 							},
 							this.getRegisteredToolDefinition(content.name),
 							this.ui,
-							this.sessionManager.getCwd(),
+							executionDirectories.get(content.id) ?? this.sessionManager.getCwd(),
 						);
 						component.setExpanded(this.toolOutputExpanded);
 						this.chatContainer.addChild(component);
@@ -5768,7 +5783,6 @@ export class InteractiveMode {
 		sessionPath: string,
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
 	): Promise<{ cancelled: boolean }> {
-		this.clearStatusIndicator();
 		try {
 			const result = await this.runtimeHost.switchSession(sessionPath, {
 				withSession: options?.withSession,
@@ -5786,11 +5800,13 @@ export class InteractiveMode {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
-					cwdOverride: selectedCwd,
-					withSession: options?.withSession,
-					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-				});
+				const result = await this.runtimeHost
+					.switchSession(sessionPath, {
+						cwdOverride: selectedCwd,
+						withSession: options?.withSession,
+						projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
+					})
+					.catch((error: unknown) => this.handleFatalRuntimeError("Failed to resume session", error));
 				if (result.cancelled) {
 					return result;
 				}
@@ -6453,8 +6469,6 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.resetExtensionUI();
-
 		const reloadBox = new Container();
 		const borderColor = (s: string) => theme.fg("border", s);
 		reloadBox.addChild(new DynamicBorder(borderColor));
@@ -6469,7 +6483,7 @@ export class InteractiveMode {
 		reloadBox.addChild(new Spacer(1));
 		reloadBox.addChild(new DynamicBorder(borderColor));
 
-		const previousEditor = this.editor;
+		let previousEditor = this.editor;
 		this.editorContainer.clear();
 		this.editorContainer.addChild(reloadBox);
 		this.ui.setFocus(reloadBox);
@@ -6496,6 +6510,17 @@ export class InteractiveMode {
 		};
 
 		try {
+			// Check the guard before disposing live extension UI, without yielding before reload takes over.
+			const resume = this.session.suspendExecutionDirectories();
+			try {
+				this.resetExtensionUI();
+				previousEditor = this.editor;
+				this.editorContainer.clear();
+				this.editorContainer.addChild(reloadBox);
+				this.ui.setFocus(reloadBox);
+			} finally {
+				resume();
+			}
 			await this.session.reload({ beforeSessionStart: restoreChatBeforeSessionStart });
 			restoreChatBeforeSessionStart();
 			this.keybindings.reload();
@@ -6594,7 +6619,6 @@ export class InteractiveMode {
 		}
 
 		try {
-			this.clearStatusIndicator();
 			const result = await this.runtimeHost.importFromJsonl(inputPath);
 			if (result.cancelled) {
 				this.showStatus("Import cancelled");
@@ -6608,7 +6632,9 @@ export class InteractiveMode {
 					this.showStatus("Import cancelled");
 					return;
 				}
-				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
+				const result = await this.runtimeHost
+					.importFromJsonl(inputPath, selectedCwd)
+					.catch((error: unknown) => this.handleFatalRuntimeError("Failed to import session", error));
 				if (result.cancelled) {
 					this.showStatus("Import cancelled");
 					return;
@@ -6940,7 +6966,6 @@ export class InteractiveMode {
 	}
 
 	private async handleClearCommand(): Promise<void> {
-		this.clearStatusIndicator();
 		try {
 			const result = await this.runtimeHost.newSession();
 			if (result.cancelled) {

@@ -633,6 +633,8 @@ export type ToolResultMessage<TDetails = JsonValue> = IsJsonCompatible<TDetails>
 			usage?: Usage;
 			/** Calls this tool made to other tools. Kept for the session record; not sent to the model. */
 			nestedCalls?: NestedToolCalls;
+			/** Working directory used for this execution. Session rendering metadata; not sent to the model. */
+			executionCwd?: string;
 			isError: boolean;
 			/** Unix timestamp in milliseconds when the result was created. */
 			timestamp: number;

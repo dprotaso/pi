@@ -14,7 +14,7 @@ import { SessionManager } from "../session-manager.ts";
  */
 export interface ToolHtmlRenderer {
 	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
-	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
+	renderCall(toolCallId: string, toolName: string, args: unknown, executionCwd?: string): string | undefined;
 	/** Render a tool result to HTML. Returns collapsed/expanded or undefined if tool has no custom renderer. */
 	renderResult(
 		toolCallId: string,
@@ -22,6 +22,7 @@ export interface ToolHtmlRenderer {
 		result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
 		details: unknown,
 		isError: boolean,
+		executionCwd?: string,
 	): { collapsed?: string; expanded?: string } | undefined;
 }
 
@@ -185,6 +186,13 @@ function preRenderCustomTools(
 	toolRenderer: ToolHtmlRenderer,
 ): Record<string, RenderedToolHtml> {
 	const renderedTools: Record<string, RenderedToolHtml> = {};
+	// Calls precede results, but both renderers need the directory recorded on the result.
+	const executionDirectories = new Map<string, string>();
+	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.executionCwd !== undefined) {
+			executionDirectories.set(entry.message.toolCallId, entry.message.executionCwd);
+		}
+	}
 
 	for (const entry of entries) {
 		if (entry.type !== "message") continue;
@@ -194,7 +202,12 @@ function preRenderCustomTools(
 		if (msg.role === "assistant" && Array.isArray(msg.content)) {
 			for (const block of msg.content) {
 				if (block.type === "toolCall" && !TEMPLATE_RENDERED_TOOLS.has(block.name)) {
-					const callHtml = toolRenderer.renderCall(block.id, block.name, block.arguments);
+					const callHtml = toolRenderer.renderCall(
+						block.id,
+						block.name,
+						block.arguments,
+						executionDirectories.get(block.id),
+					);
 					if (callHtml) {
 						renderedTools[block.id] = { callHtml };
 					}
@@ -214,6 +227,7 @@ function preRenderCustomTools(
 					msg.content,
 					msg.details,
 					msg.isError || false,
+					msg.executionCwd,
 				);
 				if (rendered) {
 					renderedTools[msg.toolCallId] = {

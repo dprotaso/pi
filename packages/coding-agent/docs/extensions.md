@@ -219,6 +219,26 @@ These operations are command-only because calling them from lifecycle handlers c
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 
+### Scoped execution directories
+
+Use `ctx.withExecutionDirectory(directory, callback)` to run work in a worktree without replacing the session:
+
+```typescript
+await ctx.withExecutionDirectory(worktree, async () => {
+  await runReview();
+});
+```
+
+Relative directories resolve against the enclosing scope, or the session directory. The target must exist and be a directory. The callback's return value or exception passes through, and the enclosing directory is restored even on failure or cancellation. Pi never calls `process.chdir()`.
+
+Within the callback, `ctx.cwd`, built-in tools, nested `ctx.executeTool()` calls and their hooks, and the default directory for `pi.exec()` share the scope. An explicit `pi.exec(..., { cwd })` wins. A model run started there advertises that directory in its system prompt. Concurrent scopes are async-local: sibling tools and unrelated commands do not change each other's directory. The footer's `exec:` status lists all active scoped directories; the normal session directory and Git branch remain unchanged.
+
+Await your work inside the callback. Pi also waits for turns started by `pi.sendUserMessage()` or `pi.sendMessage()` in that scope, although those APIs return void. For example, an idle command can use `await ctx.withExecutionDirectory(worktree, async () => { pi.sendUserMessage("Review this worktree"); });`. Errors from these message APIs still follow the normal extension error reporting path. Other detached tasks must not outlive the callback: subsequent Pi operations from an ended scope reject instead of falling back to the session directory.
+
+A session still owns only one agent run. Scoped messages cannot join a run executing in a different directory; ordinary unscoped steering joins the current run. Scoped steering, follow-ups and `nextTurn` messages require an active run in the same scope. Scoped submissions from `agent_settled` are rejected: submit after settlement instead. Reload and session replacement are refused while scopes are active. Disposal invalidates all scopes.
+
+This changes execution, not project discovery or trust. Session identity, storage location, loaded instructions, skills, extensions, settings and MCP connections remain unchanged. Custom tools must use `ctx.cwd` or `pi.exec()` rather than a captured startup directory. Preconstructed SDK tools and external MCP servers retain their own directory behavior. A scope is not a sandbox and does not restrict absolute paths or `..` traversal.
+
 <a id="state-management"></a>
 <a id="persist-state"></a>
 

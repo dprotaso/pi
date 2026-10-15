@@ -56,6 +56,7 @@ type ReloadCommandContext = {
 		isStreaming: boolean;
 		isCompacting: boolean;
 		reload: (options?: { beforeSessionStart?: () => void | Promise<void> }) => Promise<void>;
+		suspendExecutionDirectories: () => () => void;
 		resourceLoader: { getThemes: () => { themes: [] } };
 		extensionRunner: unknown;
 		modelRegistry: { getError: () => string | undefined };
@@ -127,6 +128,7 @@ function createReloadCommandContext(overrides: ReloadCommandContextOverrides = {
 			reload: async (options) => {
 				await options?.beforeSessionStart?.();
 			},
+			suspendExecutionDirectories: () => () => {},
 			resourceLoader: { getThemes: () => ({ themes: [] }) },
 			extensionRunner: {},
 			modelRegistry: { getError: () => undefined },

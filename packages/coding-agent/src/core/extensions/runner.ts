@@ -14,6 +14,7 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
+import { ExecutionDirectory } from "../execution-directory.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
@@ -367,6 +368,7 @@ export class ExtensionRunner {
 	private uiContext: ExtensionUIContext;
 	private mode: ExtensionMode = "print";
 	private cwd: string;
+	private readonly executionDirectory: ExecutionDirectory;
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
@@ -405,11 +407,14 @@ export class ExtensionRunner {
 		cwd: string,
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
+		executionDirectory = new ExecutionDirectory(cwd),
 	) {
 		this.extensions = extensions;
 		this.runtime = runtime;
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
+		this.executionDirectory = executionDirectory;
+		this.runtime.executionDirectory = executionDirectory;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
 	}
@@ -739,6 +744,13 @@ export class ExtensionRunner {
 		if (this.staleMessage) {
 			throw new Error(this.staleMessage);
 		}
+		this.executionDirectory.assertActive();
+	}
+
+	private assertNoExecutionScopes(): void {
+		if (this.executionDirectory.activeDirectories.length > 0) {
+			throw new Error("Cannot replace or reload the session while execution directory scopes are active");
+		}
 	}
 
 	onError(listener: ExtensionErrorListener): () => void {
@@ -900,7 +912,11 @@ export class ExtensionRunner {
 			},
 			get cwd() {
 				runner.assertActive();
-				return runner.cwd;
+				return runner.executionDirectory.cwd;
+			},
+			withExecutionDirectory: (directory, callback) => {
+				runner.assertActive();
+				return runner.executionDirectory.run(directory, callback);
 			},
 			get sessionManager() {
 				runner.assertActive();
@@ -1012,10 +1028,12 @@ export class ExtensionRunner {
 		};
 		context.newSession = (options) => {
 			this.assertActive();
+			this.assertNoExecutionScopes();
 			return this.newSessionHandler(options);
 		};
 		context.fork = (entryId, options) => {
 			this.assertActive();
+			this.assertNoExecutionScopes();
 			return this.forkHandler(entryId, options);
 		};
 		context.navigateTree = (targetId, options) => {
@@ -1024,10 +1042,12 @@ export class ExtensionRunner {
 		};
 		context.switchSession = (sessionPath, options) => {
 			this.assertActive();
+			this.assertNoExecutionScopes();
 			return this.switchSessionHandler(sessionPath, options);
 		};
 		context.reload = () => {
 			this.assertActive();
+			this.assertNoExecutionScopes();
 			return this.reloadHandler();
 		};
 		return context;

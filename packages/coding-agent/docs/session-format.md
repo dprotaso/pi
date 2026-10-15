@@ -94,6 +94,8 @@ Sessions created before system messages existed have no leading system message; 
 
 Assistant messages name the model that produced them. Newer messages also record `thinkingLevel`, the Pi thinking level requested for that response.
 
+Tool results can record `executionCwd`, the working directory used for a scoped top-level tool execution. History replay and HTML tool renderers use this directory for the matching tool call and result, falling back to the session cwd when absent. This is rendering metadata, not model context; it does not change the session header's `cwd`.
+
 ### ModelChangeEntry
 
 Emitted when the user switches models mid-session. The latest entry is the selected model, which may be a [virtual model](virtual-models.md); assistant messages then name the physical model that answered.
