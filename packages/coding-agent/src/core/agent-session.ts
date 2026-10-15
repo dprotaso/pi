@@ -78,6 +78,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
+import { ExecutionDirectory } from "./execution-directory.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -438,6 +439,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private readonly _executionDirectory: ExecutionDirectory;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	/**
@@ -491,6 +493,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._executionDirectory = new ExecutionDirectory(config.cwd, () => this._updateExecutionDirectoryStatus());
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
 		if (this._cacheWarmer) {
@@ -524,6 +527,33 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
+	}
+
+	/** Execution directory of the current async scope, otherwise the session working directory. */
+	get executionDirectory(): string {
+		return this._executionDirectory.cwd;
+	}
+
+	/** Directories of all active execution scopes, for host UI. */
+	get activeExecutionDirectories(): readonly string[] {
+		return this._executionDirectory.activeDirectories;
+	}
+
+	/** Run and await work in another directory without replacing the session. */
+	withExecutionDirectory<T>(directory: string, callback: () => Promise<T>): Promise<T> {
+		return this._executionDirectory.run(directory, callback);
+	}
+
+	private _withExecutionCwd<TOptions extends { cwd: string }>(options: TOptions): TOptions {
+		return this._executionDirectory.isScoped ? { ...options, cwd: this.executionDirectory } : options;
+	}
+
+	private _updateExecutionDirectoryStatus(): void {
+		const directories = this.activeExecutionDirectories;
+		this._extensionUIContext?.setStatus?.(
+			"pi:execution-directory",
+			directories.length > 0 ? `exec: ${directories.map((dir) => JSON.stringify(dir)).join(" | ")}` : undefined,
+		);
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -1472,7 +1502,7 @@ export class AgentSession {
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
-		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
+		return buildSystemPrompt(this._withExecutionCwd(this._runSystemPromptOptions ?? this._baseSystemPromptOptions));
 	}
 
 	/** Current retry attempt (0 if not retrying) */
@@ -1896,7 +1926,10 @@ export class AgentSession {
 		}
 
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
+		const result = await this._extensionRunner.emitBeforeAgentStart(
+			trigger,
+			this._withExecutionCwd(this._baseSystemPromptOptions),
+		);
 		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 		// which updates the live loadout instead. An explicit edit wins; otherwise the live
 		// loadout is authoritative, so a setActiveTools() call is not undone here.
@@ -3365,6 +3398,7 @@ export class AgentSession {
 
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
 		runner.setUIContext(this._extensionUIContext, this._extensionMode);
+		this._updateExecutionDirectoryStatus();
 		runner.bindCommandContext(this._extensionCommandContextActions);
 
 		this._extensionErrorUnsubscriber?.();
@@ -3493,7 +3527,7 @@ export class AgentSession {
 					})();
 				},
 				getSystemPrompt: () => this.systemPrompt,
-				getSystemPromptOptions: () => this._baseSystemPromptOptions,
+				getSystemPromptOptions: () => this._withExecutionCwd(this._baseSystemPromptOptions),
 				executeTool: (callerId, name, args, options) => this._executeNestedToolCall(callerId, name, args, options),
 				getCallableTools: () => this._getCallableTools(),
 			},
@@ -3670,6 +3704,7 @@ export class AgentSession {
 			this._cwd,
 			this.sessionManager,
 			new ModelRegistry(this._modelRuntime),
+			this._executionDirectory,
 		);
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
@@ -3884,7 +3919,7 @@ export class AgentSession {
 		try {
 			const result = await executeBashWithOperations(
 				resolvedCommand,
-				this.sessionManager.getCwd(),
+				this.executionDirectory,
 				options?.operations ?? createLocalBashOperations({ shellPath }),
 				{
 					onChunk: (delta) => {

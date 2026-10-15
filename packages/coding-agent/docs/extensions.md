@@ -219,6 +219,22 @@ These operations are command-only because calling them from lifecycle handlers c
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 
+### Scoped execution directories
+
+Use `ctx.withExecutionDirectory(directory, callback)` to run work in another directory, such as a Git worktree, without replacing the session:
+
+```typescript
+await ctx.withExecutionDirectory(worktree, async () => {
+  pi.sendUserMessage("Review the changes in this worktree");
+});
+```
+
+Relative paths resolve against the enclosing scope, or the session directory. The target must be an existing directory. Pi never calls `process.chdir()`; the scope follows async execution, so nested calls inherit it and overlapping scopes do not affect each other. The previous directory applies again when the callback settles.
+
+Within a scope, `ctx.cwd`, built-in tools, extension hooks, `pi.exec()` (unless `cwd` is passed) and the system prompt use the scoped directory. The footer shows `exec: "<dir>"` while a scope is active. Work started inside the scope, such as a turn from `pi.sendUserMessage()`, keeps the scoped directory after the callback returns. Messages queued into a run that is already active join that run and use its directory.
+
+Session identity, storage, loaded resources, settings and MCP servers are unchanged. Custom tools should use `ctx.cwd` rather than a directory captured at startup. A scope is not a sandbox.
+
 <a id="state-management"></a>
 <a id="persist-state"></a>
 

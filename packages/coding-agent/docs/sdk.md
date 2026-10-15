@@ -59,6 +59,18 @@ See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating,
 
 After a runtime replacement, subscriptions belong to the old `AgentSession` and must be rebound. See the [session runtime example](../examples/sdk/13-session-runtime.ts).
 
+### Scoped execution directory
+
+Use `session.withExecutionDirectory()` to run work in another directory without replacing the session:
+
+```typescript
+await session.withExecutionDirectory(worktree, async () => {
+  await session.prompt("Review the changes in this worktree.");
+});
+```
+
+`session.executionDirectory` returns the current scope's directory, or the session directory. `session.activeExecutionDirectories` lists active scopes for host UI. See [Scoped execution directories](extensions.md#scoped-execution-directories) for details.
+
 ## Prompting
 
 `prompt()` handles extension commands and expands file-based prompt templates before ordinary user messages enter the agent. For an accepted agent run, it resolves after the run finishes, including automatic retries.

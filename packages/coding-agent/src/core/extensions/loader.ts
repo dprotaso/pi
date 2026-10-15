@@ -410,7 +410,7 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			return execCommand(command, args, options?.cwd ?? runtime.executionDirectory?.cwd ?? cwd, options);
 		},
 
 		getActiveTools(): string[] {

@@ -2243,11 +2243,15 @@ export class InteractiveMode {
 		if (shortcuts.size === 0) return;
 
 		// Create a context for shortcut handlers
+		const mode = this;
 		const createContext = (): ExtensionContext => ({
 			ui: this.createExtensionUIContext(),
 			mode: "tui",
 			hasUI: true,
-			cwd: this.sessionManager.getCwd(),
+			get cwd() {
+				return mode.session.executionDirectory;
+			},
+			withExecutionDirectory: (directory, callback) => this.session.withExecutionDirectory(directory, callback),
 			sessionManager: this.sessionManager,
 			modelRegistry: extensionRunner.getModelRegistry(),
 			model: this.session.model,
@@ -3540,7 +3544,7 @@ export class InteractiveMode {
 									},
 									this.getRegisteredToolDefinition(content.name),
 									this.ui,
-									this.sessionManager.getCwd(),
+									this.session.executionDirectory,
 								);
 								component.setExpanded(this.toolOutputExpanded);
 								this.chatContainer.addChild(component);
@@ -3619,7 +3623,7 @@ export class InteractiveMode {
 						},
 						this.getRegisteredToolDefinition(event.toolName),
 						this.ui,
-						this.sessionManager.getCwd(),
+						this.session.executionDirectory,
 					);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);

@@ -61,6 +61,7 @@ import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from 
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
+import type { ExecutionDirectory } from "../execution-directory.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
@@ -329,8 +330,10 @@ export interface ExtensionContext {
 	mode: ExtensionMode;
 	/** Whether dialog-capable UI is available (true in TUI and RPC modes) */
 	hasUI: boolean;
-	/** Current working directory */
+	/** Execution directory of the current async scope, otherwise the session working directory. */
 	cwd: string;
+	/** Run and await work in a directory without replacing the session. Nested and concurrent scopes are isolated. */
+	withExecutionDirectory<T>(directory: string, callback: () => Promise<T>): Promise<T>;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */
@@ -2152,6 +2155,7 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  * Contains flag values (defaults set during registration, CLI values set after).
  */
 export interface ExtensionRuntimeState {
+	executionDirectory?: ExecutionDirectory;
 	flagValues: Map<string, boolean | string>;
 	/** Legacy provider-config registrations queued during extension loading, processed when runner binds. */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
